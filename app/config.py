@@ -16,6 +16,10 @@ class Settings:
     batch_wait_ms: int = 50       # idle model waits at most this long to fill a batch
     # Demo knob: artificial delay inside the inference worker to simulate a slow model.
     inference_delay_ms: int = 0
+    # Receipt retention (runtime reclamation of terminal orders).
+    receipt_ttl_ms: int = 60_000    # receipts stay queryable this long after settlement
+    receipt_max: int = 128          # max receipts kept; overflow evicts oldest-settled
+    sweep_interval_ms: int = 1000   # background sweeper period (queued expiry + receipt TTL)
     model_path: str = _DEFAULT_MODEL_PATH
 
     @classmethod
@@ -25,5 +29,8 @@ class Settings:
             batch_size=int(os.getenv("BATCH_SIZE", "4")),
             batch_wait_ms=int(os.getenv("BATCH_WAIT_MS", "50")),
             inference_delay_ms=int(os.getenv("INFERENCE_DELAY_MS", "0")),
+            receipt_ttl_ms=int(os.getenv("RECEIPT_TTL_MS", "60000")),
+            receipt_max=int(os.getenv("RECEIPT_MAX", "128")),
+            sweep_interval_ms=int(os.getenv("SWEEP_INTERVAL_MS", "1000")),
             model_path=os.getenv("MODEL_PATH", _DEFAULT_MODEL_PATH),
         )

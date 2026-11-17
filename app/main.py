@@ -3,9 +3,10 @@
 Endpoints
 ---------
 POST /predict                 submit an image + deadline_ms (from acceptance)
-GET  /orders/{order_id}       query status / result by order id
+GET  /orders/{order_id}       query status / result by order id (404 once the
+                              receipt retention window has ended)
 POST /orders/{order_id}/cancel  cancel a queued or in-flight order
-GET  /stats                   capacity and state counters (demo/observability)
+GET  /stats                   capacity, receipt and state counters (demo/observability)
 GET  /health                  liveness
 Interactive docs are served at /docs (Swagger UI).
 """
@@ -41,6 +42,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         batch_size=settings.batch_size,
         batch_wait_ms=settings.batch_wait_ms,
         inference_delay_ms=settings.inference_delay_ms,
+        receipt_ttl_ms=settings.receipt_ttl_ms,
+        receipt_max=settings.receipt_max,
+        sweep_interval_ms=settings.sweep_interval_ms,
     )
 
     @asynccontextmanager
@@ -56,7 +60,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "Time-limited image classification for multiple cameras. "
             "Single-process micro-batching: at most 16 queued/in-flight images, "
             "batches of up to 4, idle model waits up to 50 ms to fill a batch, "
-            "one batch infers at a time. Cancelled/expired orders never yield results."
+            "one batch infers at a time. Cancelled/expired orders never yield results. "
+            "Terminal orders are settled once they occupy no queue/compute capacity; "
+            "receipts (status + result, no image tensor) stay queryable for 60 s, "
+            "capped at 128 entries with oldest-settled evicted first — after that, "
+            "lookups return 404."
         ),
         lifespan=lifespan,
     )
@@ -83,16 +91,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/orders/{order_id}")
     async def get_order(order_id: str):
+        """Status/result while live, and afterwards from the retained receipt.
+
+        Returns 404 once the receipt has been reclaimed (TTL exceeded or
+        evicted by the retention cap)."""
         order = engine.get(order_id)
         if order is None:
-            raise HTTPException(404, "unknown order_id")
+            raise HTTPException(404, "unknown or reclaimed order_id")
         return order_view(order)
 
     @app.post("/orders/{order_id}/cancel")
     async def cancel_order(order_id: str):
         order = engine.cancel(order_id)
         if order is None:
-            raise HTTPException(404, "unknown order_id")
+            raise HTTPException(404, "unknown or reclaimed order_id")
         if order.state == COMPLETED:
             raise HTTPException(409, "order already completed; cannot cancel")
         return order_view(order)

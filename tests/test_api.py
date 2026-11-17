@@ -297,3 +297,125 @@ async def test_slow_inference_does_not_block_api(make_client):
     assert resp2.status_code == 201
     assert resp3.status_code == 200
     assert resp4.status_code == 200
+
+
+# --------------------------------------------------------------------- #
+# receipt retention & runtime reclamation
+# --------------------------------------------------------------------- #
+async def test_completed_order_settled_tensor_dropped_still_queryable(make_client):
+    c = await make_client()
+    r = await c.submit("sample_gradient.png")
+    oid = r.json()["order_id"]
+    await c.wait_state(oid, {"completed"})
+    eng = c.app.state.engine
+    assert oid not in eng._orders  # settled: left the live table
+    receipt = eng._receipts[oid]
+    assert receipt.state == "completed"
+    assert receipt.tensor is None  # receipt holds no image tensor
+    assert receipt.settled_at is not None
+    assert eng.capacity_used() == 0  # slot released
+    body = await c.get(oid)  # status + result still queryable from the receipt
+    assert body["status"] == "completed"
+    assert len(body["result"]["scores"]) == 10
+
+
+async def test_receipt_ttl_expires_without_new_requests(make_client):
+    c = await make_client(receipt_ttl_ms=400, sweep_interval_ms=50)
+    r = await c.submit("sample_gradient.png")
+    oid = r.json()["order_id"]
+    await c.wait_state(oid, {"completed"})
+    assert (await c.http.get(f"/orders/{oid}")).status_code == 200
+    await asyncio.sleep(0.9)  # no traffic at all; the sweeper must reclaim it
+    assert (await c.http.get(f"/orders/{oid}")).status_code == 404
+    assert (await c.http.post(f"/orders/{oid}/cancel")).status_code == 404
+
+
+async def test_receipt_cap_evicts_oldest_settled(make_client):
+    c = await make_client(receipt_max=3, receipt_ttl_ms=60_000)
+    ids = []
+    for i in range(5):
+        r = await c.submit(SAMPLE_NAMES[i % 4])
+        oid = r.json()["order_id"]
+        await c.wait_state(oid, {"completed"})  # settles before the next submit
+        ids.append(oid)
+    # the two earliest-settled receipts were evicted
+    assert (await c.http.get(f"/orders/{ids[0]}")).status_code == 404
+    assert (await c.http.get(f"/orders/{ids[1]}")).status_code == 404
+    for oid in ids[2:]:  # the three newest are retained with their results
+        r = await c.http.get(f"/orders/{oid}")
+        assert r.status_code == 200
+        assert r.json()["status"] == "completed"
+        assert r.json()["result"] is not None
+
+
+async def test_queued_expiry_settled_without_any_query(make_client):
+    c = await make_client(inference_delay_ms=1000, sweep_interval_ms=50)
+    for name in SAMPLE_NAMES:  # occupy the model with one batch
+        await c.submit(name)
+    await asyncio.sleep(0.2)
+    r = await c.submit("sample_gradient.png", deadline_ms=300)  # expires while queued
+    victim = r.json()["order_id"]
+    await asyncio.sleep(0.6)  # deadline passed; nobody queried the order
+    eng = c.app.state.engine
+    assert victim not in eng._orders  # sweeper settled it without a query
+    receipt = eng._receipts[victim]
+    assert receipt.state == "expired"
+    assert receipt.tensor is None
+    body = await c.get(victim)
+    assert body["status"] == "expired"
+    assert body["batch_id"] is None  # never entered the model
+
+
+async def test_cancelled_queued_order_settled_immediately(make_client):
+    c = await make_client(inference_delay_ms=1500)
+    ids = []
+    for i in range(5):  # 4 fill the running batch, 5th stays queued
+        r = await c.submit(SAMPLE_NAMES[i % 4])
+        ids.append(r.json()["order_id"])
+    await asyncio.sleep(0.2)
+    victim = ids[4]
+    await c.cancel(victim)
+    eng = c.app.state.engine
+    assert victim not in eng._orders  # settled at once: it occupied nothing
+    assert eng._receipts[victim].state == "cancelled"
+    assert eng._receipts[victim].tensor is None
+    assert eng.capacity_used() == 4  # only the running batch holds slots
+    body = await c.get(victim)
+    assert body["status"] == "cancelled" and body["result"] is None
+
+
+async def test_inflight_cancel_settles_only_after_batch_ends(make_client):
+    c = await make_client(inference_delay_ms=1200)
+    ids = []
+    for name in SAMPLE_NAMES:  # exactly one batch
+        r = await c.submit(name)
+        ids.append(r.json()["order_id"])
+    await asyncio.sleep(0.2)  # batch of 4 now computing
+    victim = ids[0]
+    r = await c.cancel(victim)
+    assert r.json()["status"] == "cancelled"  # terminal state visible at once
+    eng = c.app.state.engine
+    # ...but NOT settled while the batch computes: still live, still holding a slot
+    assert victim in eng._orders
+    assert victim not in eng._receipts
+    assert eng.capacity_used() == 4
+    await asyncio.sleep(1.4)  # batch compute actually finished
+    assert victim not in eng._orders
+    receipt = eng._receipts[victim]
+    assert receipt.state == "cancelled"
+    assert receipt.result is None  # late result did not revive it
+    assert eng.capacity_used() == 0
+    body = await c.get(victim)
+    assert body["status"] == "cancelled" and body["result"] is None
+
+
+async def test_stats_expose_receipt_counters(make_client):
+    c = await make_client()
+    r = await c.submit("sample_gradient.png")
+    oid = r.json()["order_id"]
+    await c.wait_state(oid, {"completed"})
+    stats = (await c.http.get("/stats")).json()
+    assert stats["receipts"] == 1
+    assert stats["settled_total"] >= 1
+    assert stats["orders"].get("completed") == 1
+    assert stats["capacity_used"] == 0

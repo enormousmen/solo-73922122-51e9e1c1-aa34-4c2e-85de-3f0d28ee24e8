@@ -12,4 +12,11 @@ services:
       # Demo knob: simulate slow inference (ms). Submit/query/cancel stay
       # responsive regardless. Set e.g. "2000" to see the effect.
       INFERENCE_DELAY_MS: "0"
+      # Receipt retention: settled orders (done/failed/cancelled/expired, no
+      # longer occupying queue or compute) stay queryable for 60 s, at most
+      # 128 receipts (oldest-settled evicted first), reclaimed in the
+      # background every second even without traffic. Evicted => 404.
+      RECEIPT_TTL_MS: "60000"
+      RECEIPT_MAX: "128"
+      SWEEP_INTERVAL_MS: "1000"
     restart: unless-stopped
